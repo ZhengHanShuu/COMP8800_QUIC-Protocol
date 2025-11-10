@@ -1,0 +1,7 @@
+server.crt
+server.key
+
+qlog/
+*.qlog
+secrets.log
+qlog/secrets.log
