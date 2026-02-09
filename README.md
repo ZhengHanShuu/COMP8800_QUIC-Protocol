@@ -1,6 +1,6 @@
-# QUIC Echo + CID Rotation (Python, aioquic)
+# QUIC CID Rotation (Python, aioquic)
 
-This project is a minimal **QUIC echo server and client** built with [aioquic].  
+This project is a  **QUIC CID rotation** built with **aioquic**.  
 It demonstrates:
 
 - QUIC handshake and bidirectional **STREAM** echo
@@ -27,7 +27,7 @@ Install (inside a virtualenv):
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
-pip install "aioquic>=0.9.25"
+python3 -m pip install -r requirements.txt
 ```
 
 Confirm your environment:
@@ -55,33 +55,44 @@ This creates `server.crt` and `server.key`.
 ## ▶️ Running
 
 ### 1) Server (CID rotation on by default)
-```bash
-python3 server_rot_cid.py   --addr 0.0.0.0   --port 8443   --qlog-dir qlog   --cid-interval 10
-```
 
-Optional:
-- `--auto-close` — server closes after echo (default: off)
-- `--close-delay <sec>` — delay before auto-close if enabled
+```bash
+python server.py --port 8000 --cert server.crt --key server.key --alpn hq-29 --rotate-interval 3 --jitter 1
+```
 
 ### 2) Client (holds connection so you can observe rotations)
-```bash
-python3 client_rot_cid.py   --host 127.0.0.1   --port 8443   --in "hello quic"   --qlog-dir qlog   --hold 15   --cid-interval 5
-```
 
-Expected client output:
-```
-hello quic
+```bash
+python client.py --host 127.0.0.1 --port 8000 --duration 20 --alpn hq-29 --rotate-interval 3 --jitter 1
 ```
 
 ### What you’ll see in the terminals
 
-- On each rotation you’ll see log lines like:
+- On server:
   ```
-  [EchoClient] rotated CID -> 36aec7b557c36f9a
-  [EchoServerProtocol] rotated CID -> b5237e100f4de98
+  [server] listening on 0.0.0.0:8000
+  [server] qlog dir: qlog (written on exit)
+  [server] secrets log: runs/server/secrets.log
+  [server] rotation log: runs/server/rotation.jsonl
+
+  [server cli] commands:
+  help            Show commands
+  status          Show status
+  connections     Show number of active connections
+  rotate          Force a rotate attempt on active connections
+  quit / exit     Stop server
+
+  [server cli] >
   ```
-- If you enabled server `--auto-close`, the client will stop rotating shortly after echo.
-  To observe more rotations, **leave auto-close off** and use the client’s `--hold`.
+  
+- On client:
+  ```
+   [client] connected to 127.0.0.1:8000
+   [client] qlog saved: qlog/client_1770616022.qlog.json
+   [client] rotation log: runs/rotation_client.log
+   [client] secrets log: runs/client/secrets.log
+  ```
+- It depends on the duration and the rotation-interval to shows the log file in the client terminal. It might also have delay.
 
 ---
 
@@ -90,48 +101,26 @@ hello quic
 1. Open Wireshark and capture **loopback** (`lo0` on macOS / `lo` on Linux) or your NIC.
 2. Display filter:
    ```
-   udp.port == 8443 && quic
+   udp.port == 8000 && quic
    ```
-3. Preferences → **Protocols → TLS** → set **(Pre)-Master-Secret log filename** to the **absolute path** of `qlog/secrets.log`.
+3. Preferences → **Protocols → TLS** → set **(Pre)-Master-Secret log filename** to the **absolute path** of `runs/sever/secret.log`.
 4. Add **Destination Connection ID (DCID)** as a column:
    - Click any QUIC packet → expand **QUIC** → **Header** → right-click **Destination Connection ID** → **Apply as Column**.
 
-### Which direction should match which log?
-
-- The CID printed by **client logs** (its **host CID**) will show up as **DCID in packets from the *server → client***.
-- The CID printed by **server logs** will show up as **DCID in packets from the *client → server***.
-
-Use direction filters to separate flows (replace `NNNNN` with the client’s ephemeral port you see in the capture):
-```
-# client → server
-udp.srcport == NNNNN && udp.dstport == 8443
-
-# server → client
-udp.srcport == 8443 && udp.dstport == NNNNN
-```
-
 As rotation runs, the **DCID** column will change in the appropriate direction.
 
-### Other handy filters
+## 📊 Output files (where to look)
 
-- Handshake only:
-  ```
-  quic.packet_type == 0 || quic.packet_type == 1  # Initial/Handshake
-  ```
-- STREAM frames:
-  ```
-  quic.frame_type == 0x08
-  ```
-- CONNECTION_CLOSE:
-  ```
-  quic.frame_type == 0x1c
-  ```
+Your run will produce artifacts similar to:
 
----
-
-## 📊 Visualize `.qlog` with qvis
-
-Both sides write qlogs to `qlog/`. Open https://qvis.edm.uhasselt.be and drop in the `.qlog` files to inspect timelines, frames, ACKs, etc.
+- Secrets logs (Wireshark decryption)
+- client: secrets.log (or whatever you pass via --secrets-log)
+- server: typically under runs/server/secrets.log (depends on your server config)
+- Rotation logs (CID rotation events)
+- client: runs/rotation_client.log (or similar)
+- server: runs/server/rotation.jsonl (or similar)
+- qlog traces (if enabled)
+- under a qlog/ directory (client/server qlog JSON files)
 
 ---
 
@@ -143,45 +132,21 @@ Both sides write qlogs to `qlog/`. Open https://qvis.edm.uhasselt.be and drop in
 - `--cert`, `--key` *(defaults: `server.crt`, `server.key`)*
 - `--qlog-dir` *(default: `qlog`)*
 - `--cid-interval` *(seconds between CID rotations; default: 10)*
-- `--auto-close` *(close after echo; default: off)*
-- `--close-delay` *(delay before auto-close)*
 
 ### Client
 - `--host` *(default: 127.0.0.1)*
 - `--port` *(default: 8443)*
-- `--in` *(message to echo; default: "hello quic")*
 - `--qlog-dir` *(append secrets to `qlog/secrets.log`)*
-- `--local-port` *(bind a local UDP port; default: 0 = ephemeral)*
-- `--hold` *(keep connection open after echo; default: 15s)*
+- `--duration` *(keep connection open after echo; default: 15s)*
 - `--cid-interval` *(seconds between rotations; default: 5)*
 
-> Security note (demo only): the client sets `cfg.verify_mode = CERT_NONE` so self-signed `server.crt` works.  
-> For real deployments, use:
-> ```python
-> cfg.verify_mode = ssl.CERT_REQUIRED
-> cfg.load_verify_locations("server.crt")
-> ```
+## Troubleshooting
 
----
+- **Client can’t connect + server shows “No common ALPN protocols**  
+-- This usually means the client and server don’t agree on the application protocol string (ALPN). Make sure both sides set the same ALPN list (for example ["hq-29"] or a consistent value used in both configs).
 
-## 🧰 Troubleshooting
+- **Wireshark shows QUIC but payload is “Protected Payload”**  
+-- Normal unless you configured TLS secrets log in Wireshark correctly.
 
-- **`WARNING change_connection_id() not available in this aioquic quic version`**  
-  You’re running an older `aioquic`. Upgrade in the same venv you use to run:
-  ```bash
-  pip install --upgrade "aioquic>=0.9.25"
-  ```
-  Re-check with the one-liner under *Requirements*.
-
-- **Rotations stop quickly on the client**  
-  The server likely closed after echo. Run the server **without** `--auto-close`, or add `--close-delay 20` to watch more rotations.
-
-- **Wireshark CIDs don’t match my logs**  
-  Check **direction** (see “Which direction should match which log?”) and make DCID a column. Remember: your log shows the CIDs **you advertise**; they appear as **the peer’s DCID**.
-
-- **No decrypted QUIC**  
-  Ensure `qlog/secrets.log` path is correct and absolute in Wireshark TLS settings. Start capture **before** running client/server.
-
----
-
-Happy hacking & privacy-testing!
+- **Rotation logs show rotate_ok but “found” is empty**  
+-- It can mean the rotation attempt executed but there were no available/advertised CIDs to switch to at that moment, or the API used didn’t expose the peer CID set. Check both sides’ rotation logs to confirm behavior.
