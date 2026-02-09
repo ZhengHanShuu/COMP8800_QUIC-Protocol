@@ -1,172 +1,229 @@
-import argparse, asyncio, logging
-from pathlib import Path
+import argparse
+import asyncio
+import json
+import os
+import time
+from typing import Set
 
 from aioquic.asyncio import QuicConnectionProtocol, serve
 from aioquic.quic.configuration import QuicConfiguration
-from aioquic.quic.events import (
-    ProtocolNegotiated,
-    StreamDataReceived,
-    ConnectionTerminated,
-)
-from aioquic.quic.logger import QuicFileLogger
+from aioquic.quic.logger import QuicLogger
 
-ALPN = ["hq-interop"]
+from cid_lifecycle import CidLifecycleManager, RotationPolicy
 
 
-class RotatingCIDMixin:
-    """
-    Periodically switches to a fresh outbound Connection ID and logs the active CID hex.
-    Shuts down cleanly on connection close.
-    """
-    def __init__(self, *args, cid_interval: float = 8.0, **kwargs):
+class EchoServerProtocol(QuicConnectionProtocol):
+    def __init__(
+        self,
+        *args,
+        clm: CidLifecycleManager = None,
+        registry: Set["EchoServerProtocol"] = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
-        self._cid_interval = cid_interval
-        self._cid_task = None
-        self._cid_stop = asyncio.Event()
+        self._clm = clm
+        self._registry = registry
+        if self._registry is not None:
+            self._registry.add(self)
 
-    # ---------- helpers ----------
+        # periodic timer to trigger rotation attempts
+        self._ticker_task = asyncio.create_task(self._ticker())
 
-    @staticmethod
-    def _to_bytes(x):
-        if x is None:
-            return None
-        if isinstance(x, (bytes, bytearray)):
-            return bytes(x)
+    async def _ticker(self):
         try:
-            return bytes(x)  # memoryview or buffer-protocol
-        except Exception:
-            return None
-
-    def _current_outbound_cid_hex(self):
-        """
-        For this aioquic build: use the QuicConnectionId with the largest sequence_number.
-        """
-        qc = self._quic
-        host_cids = getattr(qc, "_host_cids", None)
-        if not host_cids:
-            return None
-
-        # QuicConnectionId objects with attributes: cid (bytes/memoryview), sequence_number (int),
-        # stateless_reset_token, was_sent (bool). Pick the highest sequence_number.
-        try:
-            best = max(host_cids, key=lambda x: getattr(x, "sequence_number", -1))
-            cid = getattr(best, "cid", None)
-            if cid is None:
-                return None
-            # cid might be bytes, bytearray, or memoryview
-            if not isinstance(cid, (bytes, bytearray)):
-                cid = bytes(cid)
-            return cid.hex()
-        except Exception:
-            return None
-
-    # ---------- lifecycle ----------
-
-    def connection_made(self, transport):
-        super().connection_made(transport)
-        self._cid_task = asyncio.create_task(self._cid_rotator())
-
-    def connection_lost(self, exc):
-        if self._cid_task:
-            self._cid_stop.set()
-            self._cid_task.cancel()
-        return super().connection_lost(exc)
-
-    async def _cid_rotator(self):
-        try:
-            await asyncio.sleep(0.8)  # give handshake a moment
-            while not self._cid_stop.is_set():
-                if getattr(self._quic, "is_closing", False) or getattr(self._quic, "_close_pending", False):
-                    break
-                try:
-                    self._quic.change_connection_id()
-                    self.transmit()
-                    cid_hex = self._current_outbound_cid_hex()
-                    logging.info("[%s] rotated CID -> %s", self.__class__.__name__, cid_hex or "<unknown>")
-                    #logging.info("DEBUG host_cids=%r idx=%r pm=%r",
-                                 #getattr(self._quic, "_host_cids", None),
-                                 #getattr(self._quic, "_host_cid_in_use", None) or getattr(self._quic, "_connection_id_in_use", None),
-                                 #type(getattr(self._quic, "_path_manager", None)).__name__ if getattr(self._quic, "_path_manager", None) else None)
-
-                except AttributeError:
-                    logging.warning("change_connection_id() not available in this aioquic version")
-                    break
-                await asyncio.sleep(self._cid_interval)
+            while True:
+                await asyncio.sleep(0.2)
+                if self._clm is not None:
+                    self._clm.maybe_rotate(self._quic, reason="timer")
         except asyncio.CancelledError:
-            pass
-
-
-class EchoServerProtocol(RotatingCIDMixin, QuicConnectionProtocol):
-    def __init__(self, *args, cid_interval=10.0, auto_close=False, close_delay=0.0, **kwargs):
-        super().__init__(*args, cid_interval=cid_interval, **kwargs)
-        self._auto_close = auto_close
-        self._close_delay = close_delay
+            return
 
     def quic_event_received(self, event):
-        if isinstance(event, ProtocolNegotiated):
-            logging.info("[server] ALPN: %s", event.alpn_protocol)
+        # Simple stream echo
+        from aioquic.quic.events import StreamDataReceived
 
         if isinstance(event, StreamDataReceived):
-            self._quic.send_stream_data(event.stream_id, event.data, end_stream=event.end_stream)
-            self.transmit()
-            if self._auto_close and event.end_stream:
-                async def _delayed_close():
-                    if self._close_delay > 0:
-                        await asyncio.sleep(self._close_delay)
-                    self._quic.close(error_code=0x0, reason_phrase="server done")
-                    self.transmit()
-                asyncio.create_task(_delayed_close())
+            stream_id = event.stream_id
+            data = event.data
+            if data:
+                self._quic.send_stream_data(
+                    stream_id, data, end_stream=event.end_stream
+                )
+                self.transmit()
 
-        if isinstance(event, ConnectionTerminated):
-            logging.info("[server] connection terminated: %s", event.reason_phrase or "")
-            if self._cid_task:
-                self._cid_stop.set()
-                self._cid_task.cancel()
+    def connection_lost(self, exc):
+        if hasattr(self, "_ticker_task"):
+            self._ticker_task.cancel()
+        if self._registry is not None and self in self._registry:
+            self._registry.remove(self)
+        return super().connection_lost(exc)
+
+
+def ensure_cert(cert_path: str, key_path: str):
+    """
+    You need a TLS cert for QUIC. If you already have one, skip.
+    If you don't, generate quickly:
+      openssl req -x509 -newkey rsa:2048 -keyout server.key -out server.crt -days 365 -nodes -subj "/CN=localhost"
+    """
+    if not (os.path.exists(cert_path) and os.path.exists(key_path)):
+        raise RuntimeError(
+            f"Missing cert/key. Generate with:\n"
+            f'  openssl req -x509 -newkey rsa:2048 -keyout {key_path} -out {cert_path} '
+            f'-days 365 -nodes -subj "/CN=localhost"'
+        )
+
+
+def write_qlog(quic_logger: QuicLogger, path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        # support different aioquic versions
+        if hasattr(quic_logger, "to_json"):
+            f.write(quic_logger.to_json())
+        elif hasattr(quic_logger, "to_dict"):
+            f.write(json.dumps(quic_logger.to_dict(), indent=2))
+        elif hasattr(quic_logger, "traces"):
+            f.write(json.dumps({"traces": quic_logger.traces}, indent=2))
+        else:
+            f.write(json.dumps({"error": "Unsupported QuicLogger API"}, indent=2))
+
+
+def force_rotate_all(
+    protocols: Set[EchoServerProtocol], clm: CidLifecycleManager
+) -> None:
+    # Best-effort manual rotation on all active connections
+    count = 0
+    for p in list(protocols):
+        try:
+            # call the CLM best-effort rotate immediately
+            ok, detail = clm._try_rotate_local_cid(p._quic)  # intentional (best-effort)
+            clm.log.log(
+                {
+                    "event": "rotate_ok" if ok else "rotate_failed",
+                    "role": "server",
+                    "reason": "manual",
+                    "detail": detail,
+                }
+            )
+            count += 1
+        except Exception as e:
+            clm.log.log(
+                {
+                    "event": "rotate_failed",
+                    "role": "server",
+                    "reason": "manual",
+                    "detail": {"note": f"{type(e).__name__}: {e}"},
+                }
+            )
+    print(f"[server] manual rotate requested for {count} connection(s)", flush=True)
+
+
+async def cli_loop(protocols: Set[EchoServerProtocol], clm: CidLifecycleManager):
+    help_text = (
+        "\n[server cli] commands:\n"
+        "  help            Show commands\n"
+        "  status          Show status\n"
+        "  connections     Show number of active connections\n"
+        "  rotate          Force a rotate attempt on active connections\n"
+        "  quit / exit     Stop server\n"
+    )
+    print(help_text, flush=True)
+
+    while True:
+        # Run blocking stdin read in a thread so it doesn't break QUIC
+        cmd = (await asyncio.to_thread(input, "[server cli] > ")).strip().lower()
+
+        if cmd in ("help", "?"):
+            print(help_text, flush=True)
+        elif cmd in ("status",):
+            print(
+                f"[server] active connections: {len(protocols)} | "
+                f"policy: interval={clm.policy.rotate_interval_s}s jitter={clm.policy.jitter_s}s min_gap={clm.policy.min_gap_s}s",
+                flush=True,
+            )
+        elif cmd in ("connections", "conn"):
+            print(f"[server] active connections: {len(protocols)}", flush=True)
+        elif cmd in ("rotate", "r"):
+            force_rotate_all(protocols, clm)
+        elif cmd in ("quit", "exit", "q"):
+            print("[server] shutting down...", flush=True)
+            return
+        elif cmd == "":
+            continue
+        else:
+            print("[server cli] unknown command. type 'help'.", flush=True)
 
 
 async def main():
-    ap = argparse.ArgumentParser(description="QUIC Echo Server with CID rotation (aioquic)")
-    ap.add_argument("--addr", default="0.0.0.0")
-    ap.add_argument("--port", type=int, default=8443)
-    ap.add_argument("--cert", default=str(Path(__file__).with_name("server.crt")))
-    ap.add_argument("--key",  default=str(Path(__file__).with_name("server.key")))
-    ap.add_argument("--qlog-dir", default=str(Path(__file__).with_name("qlog")))
-    ap.add_argument("--cid-interval", type=float, default=10.0)
-    ap.add_argument("--auto-close", action="store_true")
-    ap.add_argument("--close-delay", type=float, default=0.0)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--port", type=int, default=4433)
+    ap.add_argument("--cert", default="server.crt")
+    ap.add_argument("--key", default="server.key")
+    ap.add_argument("--qlog-dir", default="qlog")
+    ap.add_argument("--secrets-log", default="runs/server/secrets.log")
+    ap.add_argument("--rotation-log", default="runs/server/rotation.jsonl")
+    ap.add_argument("--rotate-interval", type=float, default=15.0)
+    ap.add_argument("--jitter", type=float, default=2.0)
+    ap.add_argument("--alpn", default="hq-29", help="ALPN protocol (e.g., hq-29, h3, h3-29)")
     args = ap.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    ensure_cert(args.cert, args.key)
+    os.makedirs(args.qlog_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(args.secrets_log), exist_ok=True)
+    os.makedirs(os.path.dirname(args.rotation_log), exist_ok=True)
 
-    cfg = QuicConfiguration(is_client=False, alpn_protocols=ALPN)
-    cfg.connection_id_length = 8
-    cfg.load_cert_chain(args.cert, args.key)
+    quic_logger = QuicLogger()
+    config = QuicConfiguration(
+        is_client=False,
+        alpn_protocols=[args.alpn],
+        quic_logger=quic_logger,
+    )
+    config.load_cert_chain(args.cert, args.key)
+    config.secrets_log_file = open(args.secrets_log, "a", encoding="utf-8")
 
-    qdir = Path(args.qlog_dir); qdir.mkdir(parents=True, exist_ok=True)
-    cfg.secrets_log_file = open(qdir / "secrets.log", "w")
-    cfg.quic_logger = QuicFileLogger(str(qdir))
+    policy = RotationPolicy(
+        rotate_interval_s=args.rotate_interval,
+        jitter_s=args.jitter,
+        min_gap_s=max(5.0, args.rotate_interval * 0.5),
+    )
+    clm = CidLifecycleManager(policy, log_path=args.rotation_log, role="server")
+
+    active_protocols: Set[EchoServerProtocol] = set()
 
     server = await serve(
-        args.addr, args.port,
-        configuration=cfg,
-        create_protocol=lambda *a, **kw: EchoServerProtocol(
-            *a,
-            cid_interval=args.cid_interval,
-            auto_close=args.auto_close,
-            close_delay=args.close_delay,
-            **kw
+        args.host,
+        args.port,
+        configuration=config,
+        create_protocol=lambda *p, **kw: EchoServerProtocol(
+            *p, clm=clm, registry=active_protocols, **kw
         ),
-        retry=False,
     )
-    logging.info("[server] listening on %s:%d (udp)", args.addr, args.port)
+
+    print(f"[server] listening on {args.host}:{args.port}", flush=True)
+    print(f"[server] qlog dir: {args.qlog_dir} (written on exit)", flush=True)
+    print(f"[server] secrets log: {args.secrets_log}", flush=True)
+    print(f"[server] rotation log: {args.rotation_log}", flush=True)
+
     try:
-        await asyncio.Future()
+        # run CLI until user quits
+        await cli_loop(active_protocols, clm)
     finally:
         server.close()
+        if hasattr(server, "wait_closed"): await server.wait_closed()
+
+        # close secrets log
+        try:
+            if config.secrets_log_file:
+                config.secrets_log_file.close()
+        except Exception:
+            pass
+
+        # write qlog at shutdown
+        qlog_path = os.path.join(args.qlog_dir, f"server_{int(time.time())}.qlog.json")
+        write_qlog(quic_logger, qlog_path)
+        print(f"[server] wrote qlog: {qlog_path}", flush=True)
+        print("[server] bye", flush=True)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(main())
