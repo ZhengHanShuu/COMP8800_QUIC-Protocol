@@ -13,7 +13,7 @@ It demonstrates:
 
 ---
 
-## 📦 Requirements
+## Requirements
 
 - Python **3.9+** (tested with 3.13 on macOS)
 - **aioquic ≥ 0.9.25** (needed for `change_connection_id()` API)
@@ -40,7 +40,7 @@ python3 -c "import sys, aioquic, aioquic.quic.connection as c; print(sys.executa
 
 ---
 
-## 🔐 Certificates
+## Certificates
 
 Generate a local self-signed cert/key once:
 
@@ -52,7 +52,7 @@ This creates `server.crt` and `server.key`.
 
 ---
 
-## ▶️ Running
+## Running
 
 ### 1) Server (CID rotation on by default)
 
@@ -96,7 +96,7 @@ python client.py --host 127.0.0.1 --port 8000 --duration 20 --alpn hq-29 --rotat
 
 ---
 
-## 🔍 Inspect with Wireshark (incl. seeing CID rotation)
+## Inspect with Wireshark (incl. seeing CID rotation)
 
 1. Open Wireshark and capture **loopback** (`lo0` on macOS / `lo` on Linux) or your NIC.
 2. Display filter:
@@ -109,7 +109,7 @@ python client.py --host 127.0.0.1 --port 8000 --duration 20 --alpn hq-29 --rotat
 
 As rotation runs, the **DCID** column will change in the appropriate direction.
 
-## 📊 Output files (where to look)
+## Output files (where to look)
 
 Your run will produce artifacts similar to:
 
@@ -124,7 +124,7 @@ Your run will produce artifacts similar to:
 
 ---
 
-## ⚙️ Program options (summary)
+## Program options (summary)
 
 ### Server
 - `--addr` *(default: 0.0.0.0)*
