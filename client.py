@@ -6,7 +6,7 @@ import ssl
 import time
 from typing import Optional
 
-from aioquic.asyncio import connect, QuicConnectionProtocol
+from aioquic.asyncio import QuicConnectionProtocol, connect
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.logger import QuicLogger
 
@@ -40,7 +40,7 @@ class ClientProtocol(QuicConnectionProtocol):
             while True:
                 await asyncio.sleep(0.2)
                 if self._clm is not None:
-                    self._clm.maybe_rotate(self._quic, reason="timer")
+                    self._clm.tick(self)
         except asyncio.CancelledError:
             return
 
@@ -61,16 +61,36 @@ async def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=4433)
     parser.add_argument("--duration", type=float, default=20.0)
-
-    parser.add_argument("--rotate-interval", type=float, default=0.0)
-    parser.add_argument("--jitter", type=float, default=0.0)
-    parser.add_argument("--min-gap", type=float, default=10.0)
+    parser.add_argument("--send-interval", type=float, default=1.0)
+    parser.add_argument("--payload-size", type=int, default=0, help="Pad payload to this size in bytes; 0 disables padding")
 
     parser.add_argument("--qlog-dir", default="qlog")
-    parser.add_argument("--runs-dir", default="runs")
+    parser.add_argument("--runs-dir", default="runs/client")
     parser.add_argument("--secrets-log", default="runs/client/secrets.log")
     parser.add_argument("--alpn", default="hq-29", help="ALPN protocol (e.g., hq-29, h3, h3-29)")
+
+    # Milestone 4 flags
+    parser.add_argument("--cid-policy", choices=["baseline", "clm"], default="clm")
+    parser.add_argument("--cid-time-interval", type=float, default=15.0)
+    parser.add_argument("--cid-jitter", type=float, default=0.10, help="Jitter fraction J, e.g. 0.10 for ±10%")
+    parser.add_argument("--cid-byte-threshold", type=int, default=0)
+    parser.add_argument("--cid-grace-period", type=float, default=3.0)
+    parser.add_argument("--cid-min-gap", type=float, default=1.0)
+    parser.add_argument("--cid-random-seed", type=int, default=None)
+
+    # Optional experiment helper
+    parser.add_argument(
+        "--simulate-path-change-after",
+        type=float,
+        default=0.0,
+        help="Trigger a simulated validated path-change after N seconds; 0 disables",
+    )
+
     args = parser.parse_args()
+
+    os.makedirs(args.runs_dir, exist_ok=True)
+    os.makedirs(args.qlog_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(args.secrets_log), exist_ok=True)
 
     configuration = QuicConfiguration(is_client=True, alpn_protocols=[args.alpn])
     configuration.verify_mode = ssl.CERT_NONE
@@ -79,13 +99,20 @@ async def main():
     quic_logger = QuicLogger()
     configuration.quic_logger = quic_logger
 
-    os.makedirs(args.runs_dir, exist_ok=True)
     policy = RotationPolicy(
-        rotate_interval_s=args.rotate_interval,
-        jitter_s=args.jitter,
-        min_gap_s=args.min_gap,
+        cid_policy=args.cid_policy,
+        cid_time_interval_s=args.cid_time_interval,
+        cid_jitter_fraction=args.cid_jitter,
+        cid_byte_threshold=args.cid_byte_threshold,
+        cid_grace_period_s=args.cid_grace_period,
+        min_gap_s=args.cid_min_gap,
+        random_seed=args.cid_random_seed,
     )
-    clm = CidLifecycleManager(policy, os.path.join(args.runs_dir, "rotation_client.log"), role="client")
+    clm = CidLifecycleManager(
+        policy=policy,
+        log_path=os.path.join(args.runs_dir, "rotation_client.jsonl"),
+        role="client",
+    )
 
     start_ts = int(time.time())
     qlog_path = os.path.join(args.qlog_dir, f"client_{start_ts}.qlog.json")
@@ -99,41 +126,58 @@ async def main():
         assert isinstance(protocol, ClientProtocol)
         print(f"[client] connected to {args.host}:{args.port}")
 
-        # Create a single bidirectional stream id
         stream_id = protocol._quic.get_next_available_stream_id(is_unidirectional=False)
 
         deadline = time.time() + args.duration
+        path_change_sent = False
         counter = 0
 
         while time.time() < deadline:
-            payload = f"ping {counter} @ {time.time():.3f}\n".encode("utf-8")
+            now = time.time()
+            payload = f"ping {counter} @ {now:.3f}\n".encode("utf-8")
+
+            if args.payload_size > 0 and len(payload) < args.payload_size:
+                payload += b"x" * (args.payload_size - len(payload))
+
             protocol._quic.send_stream_data(stream_id, payload, end_stream=False)
             protocol.transmit()
 
-            # wait a bit for echo (optional)
             try:
-                sid, data, end_stream = await asyncio.wait_for(protocol._recv_q.get(), timeout=1.0)
-                if data:
-                    # keep output short
-                    pass
+                await asyncio.wait_for(protocol._recv_q.get(), timeout=1.0)
             except asyncio.TimeoutError:
                 pass
 
-            counter += 1
-            await asyncio.sleep(1.0)
+            if (
+                args.simulate_path_change_after > 0
+                and not path_change_sent
+                and (time.time() >= (deadline - args.duration + args.simulate_path_change_after))
+            ):
+                path_change_sent = True
+                clm.on_path_validated(
+                    protocol,
+                    path_id=f"simulated-client-path-{int(time.time())}",
+                    old_path_id="simulated-old-path",
+                )
 
-        # End the stream ONCE (send FIN once)
+            counter += 1
+            await asyncio.sleep(args.send_interval)
+
         protocol._quic.send_stream_data(stream_id, b"", end_stream=True)
         protocol.transmit()
 
-        # Close connection cleanly
         protocol.close()
         if hasattr(protocol, "wait_closed"):
             await protocol.wait_closed()
 
+    try:
+        if configuration.secrets_log_file:
+            configuration.secrets_log_file.close()
+    except Exception:
+        pass
+
     write_qlog(quic_logger, qlog_path)
     print(f"[client] qlog saved: {qlog_path}")
-    print(f"[client] rotation log: {os.path.join(args.runs_dir, 'rotation_client.log')}")
+    print(f"[client] rotation log: {os.path.join(args.runs_dir, 'rotation_client.jsonl')}")
     print(f"[client] secrets log: {args.secrets_log}")
 
 

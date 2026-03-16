@@ -26,7 +26,6 @@ class EchoServerProtocol(QuicConnectionProtocol):
         if self._registry is not None:
             self._registry.add(self)
 
-        # periodic timer to trigger rotation attempts
         self._ticker_task = asyncio.create_task(self._ticker())
 
     async def _ticker(self):
@@ -34,20 +33,17 @@ class EchoServerProtocol(QuicConnectionProtocol):
             while True:
                 await asyncio.sleep(0.2)
                 if self._clm is not None:
-                    self._clm.maybe_rotate(self._quic, reason="timer")
+                    self._clm.tick(self)
         except asyncio.CancelledError:
             return
 
     def quic_event_received(self, event):
-        # Simple stream echo
         from aioquic.quic.events import StreamDataReceived
 
         if isinstance(event, StreamDataReceived):
-            stream_id = event.stream_id
-            data = event.data
-            if data:
+            if event.data:
                 self._quic.send_stream_data(
-                    stream_id, data, end_stream=event.end_stream
+                    event.stream_id, event.data, end_stream=event.end_stream
                 )
                 self.transmit()
 
@@ -60,11 +56,6 @@ class EchoServerProtocol(QuicConnectionProtocol):
 
 
 def ensure_cert(cert_path: str, key_path: str):
-    """
-    You need a TLS cert for QUIC. If you already have one, skip.
-    If you don't, generate quickly:
-      openssl req -x509 -newkey rsa:2048 -keyout server.key -out server.crt -days 365 -nodes -subj "/CN=localhost"
-    """
     if not (os.path.exists(cert_path) and os.path.exists(key_path)):
         raise RuntimeError(
             f"Missing cert/key. Generate with:\n"
@@ -76,7 +67,6 @@ def ensure_cert(cert_path: str, key_path: str):
 def write_qlog(quic_logger: QuicLogger, path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        # support different aioquic versions
         if hasattr(quic_logger, "to_json"):
             f.write(quic_logger.to_json())
         elif hasattr(quic_logger, "to_dict"):
@@ -87,23 +77,11 @@ def write_qlog(quic_logger: QuicLogger, path: str) -> None:
             f.write(json.dumps({"error": "Unsupported QuicLogger API"}, indent=2))
 
 
-def force_rotate_all(
-    protocols: Set[EchoServerProtocol], clm: CidLifecycleManager
-) -> None:
-    # Best-effort manual rotation on all active connections
+def force_rotate_all(protocols: Set[EchoServerProtocol], clm: CidLifecycleManager) -> None:
     count = 0
     for p in list(protocols):
         try:
-            # call the CLM best-effort rotate immediately
-            ok, detail = clm._try_rotate_local_cid(p._quic)  # intentional (best-effort)
-            clm.log.log(
-                {
-                    "event": "rotate_ok" if ok else "rotate_failed",
-                    "role": "server",
-                    "reason": "manual",
-                    "detail": detail,
-                }
-            )
+            clm.force_rotate(p, reason="manual")
             count += 1
         except Exception as e:
             clm.log.log(
@@ -117,33 +95,61 @@ def force_rotate_all(
     print(f"[server] manual rotate requested for {count} connection(s)", flush=True)
 
 
+def simulate_path_change_all(protocols: Set[EchoServerProtocol], clm: CidLifecycleManager) -> None:
+    count = 0
+    tag = f"simulated-path-{int(time.time())}"
+    for p in list(protocols):
+        try:
+            clm.on_path_validated(p, path_id=tag, old_path_id="manual-trigger")
+            count += 1
+        except Exception as e:
+            clm.log.log(
+                {
+                    "event": "rotate_failed",
+                    "role": "server",
+                    "reason": "path_change",
+                    "detail": {"note": f"{type(e).__name__}: {e}", "path_id": tag},
+                }
+            )
+    print(f"[server] simulated path-change requested for {count} connection(s)", flush=True)
+
+
 async def cli_loop(protocols: Set[EchoServerProtocol], clm: CidLifecycleManager):
     help_text = (
         "\n[server cli] commands:\n"
-        "  help            Show commands\n"
-        "  status          Show status\n"
-        "  connections     Show number of active connections\n"
-        "  rotate          Force a rotate attempt on active connections\n"
-        "  quit / exit     Stop server\n"
+        "  help              Show commands\n"
+        "  status            Show status\n"
+        "  connections       Show number of active connections\n"
+        "  rotate            Force a rotate attempt on active connections\n"
+        "  path-change       Simulate a validated path change on active connections\n"
+        "  quit / exit       Stop server\n"
     )
     print(help_text, flush=True)
 
     while True:
-        # Run blocking stdin read in a thread so it doesn't break QUIC
         cmd = (await asyncio.to_thread(input, "[server cli] > ")).strip().lower()
 
         if cmd in ("help", "?"):
             print(help_text, flush=True)
-        elif cmd in ("status",):
+        elif cmd == "status":
+            p = clm.policy
             print(
-                f"[server] active connections: {len(protocols)} | "
-                f"policy: interval={clm.policy.rotate_interval_s}s jitter={clm.policy.jitter_s}s min_gap={clm.policy.min_gap_s}s",
+                "[server] "
+                f"active_connections={len(protocols)} "
+                f"policy={p.cid_policy} "
+                f"time_interval={p.cid_time_interval_s}s "
+                f"jitter_fraction={p.cid_jitter_fraction} "
+                f"byte_threshold={p.cid_byte_threshold} "
+                f"grace_period={p.cid_grace_period_s}s "
+                f"min_gap={p.min_gap_s}s",
                 flush=True,
             )
         elif cmd in ("connections", "conn"):
             print(f"[server] active connections: {len(protocols)}", flush=True)
         elif cmd in ("rotate", "r"):
             force_rotate_all(protocols, clm)
+        elif cmd in ("path-change", "path", "p"):
+            simulate_path_change_all(protocols, clm)
         elif cmd in ("quit", "exit", "q"):
             print("[server] shutting down...", flush=True)
             return
@@ -155,6 +161,7 @@ async def cli_loop(protocols: Set[EchoServerProtocol], clm: CidLifecycleManager)
 
 async def main():
     ap = argparse.ArgumentParser()
+
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=4433)
     ap.add_argument("--cert", default="server.crt")
@@ -162,9 +169,17 @@ async def main():
     ap.add_argument("--qlog-dir", default="qlog")
     ap.add_argument("--secrets-log", default="runs/server/secrets.log")
     ap.add_argument("--rotation-log", default="runs/server/rotation.jsonl")
-    ap.add_argument("--rotate-interval", type=float, default=15.0)
-    ap.add_argument("--jitter", type=float, default=2.0)
     ap.add_argument("--alpn", default="hq-29", help="ALPN protocol (e.g., hq-29, h3, h3-29)")
+
+    # Milestone 4 flags
+    ap.add_argument("--cid-policy", choices=["baseline", "clm"], default="clm")
+    ap.add_argument("--cid-time-interval", type=float, default=15.0)
+    ap.add_argument("--cid-jitter", type=float, default=0.10, help="Jitter fraction J, e.g. 0.10 for ±10%")
+    ap.add_argument("--cid-byte-threshold", type=int, default=0)
+    ap.add_argument("--cid-grace-period", type=float, default=3.0)
+    ap.add_argument("--cid-min-gap", type=float, default=1.0)
+    ap.add_argument("--cid-random-seed", type=int, default=None)
+
     args = ap.parse_args()
 
     ensure_cert(args.cert, args.key)
@@ -182,9 +197,13 @@ async def main():
     config.secrets_log_file = open(args.secrets_log, "a", encoding="utf-8")
 
     policy = RotationPolicy(
-        rotate_interval_s=args.rotate_interval,
-        jitter_s=args.jitter,
-        min_gap_s=max(5.0, args.rotate_interval * 0.5),
+        cid_policy=args.cid_policy,
+        cid_time_interval_s=args.cid_time_interval,
+        cid_jitter_fraction=args.cid_jitter,
+        cid_byte_threshold=args.cid_byte_threshold,
+        cid_grace_period_s=args.cid_grace_period,
+        min_gap_s=args.cid_min_gap,
+        random_seed=args.cid_random_seed,
     )
     clm = CidLifecycleManager(policy, log_path=args.rotation_log, role="server")
 
@@ -205,20 +224,18 @@ async def main():
     print(f"[server] rotation log: {args.rotation_log}", flush=True)
 
     try:
-        # run CLI until user quits
         await cli_loop(active_protocols, clm)
     finally:
         server.close()
-        if hasattr(server, "wait_closed"): await server.wait_closed()
+        if hasattr(server, "wait_closed"):
+            await server.wait_closed()
 
-        # close secrets log
         try:
             if config.secrets_log_file:
                 config.secrets_log_file.close()
         except Exception:
             pass
 
-        # write qlog at shutdown
         qlog_path = os.path.join(args.qlog_dir, f"server_{int(time.time())}.qlog.json")
         write_qlog(quic_logger, qlog_path)
         print(f"[server] wrote qlog: {qlog_path}", flush=True)
