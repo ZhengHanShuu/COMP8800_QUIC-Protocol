@@ -2,32 +2,18 @@ import json
 import os
 import random
 import time
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional
 
 
 @dataclass
 class RotationPolicy:
-    # "baseline" disables all CLM-triggered rotations
     cid_policy: str = "clm"  # baseline | clm
-
-    # Time-based rotation
     cid_time_interval_s: float = 30.0
-
-    # J is a fraction, so effective lifetime is:
-    # T_eff = T * (1 + delta), delta in [-J, +J]
     cid_jitter_fraction: float = 0.0
-
-    # Volume-based trigger; 0 disables
     cid_byte_threshold: int = 0
-
-    # Grace period before retiring old CID; 0 means immediate retire
     cid_grace_period_s: float = 0.0
-
-    # Anti-churn guard
     min_gap_s: float = 1.0
-
-    # Optional deterministic seed for reproducible experiments
     random_seed: Optional[int] = None
 
 
@@ -65,16 +51,20 @@ class CidLifecycleManager:
       - volume-based trigger
       - grace-period retirement
       - structured JSONL logs
-
-    Notes:
-      - Uses aioquic internals for deferred CID retirement when grace_period > 0.
-      - Falls back to public change_connection_id() if deferred retirement is unavailable.
+      - optional console callback for demo-friendly terminal output
     """
 
-    def __init__(self, policy: RotationPolicy, log_path: str, role: str):
+    def __init__(
+        self,
+        policy: RotationPolicy,
+        log_path: str,
+        role: str,
+        console_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ):
         self.policy = policy
         self.log = JsonlLogger(log_path)
         self.role = role
+        self.console_callback = console_callback
 
         self._rng = random.Random(policy.random_seed)
 
@@ -89,12 +79,15 @@ class CidLifecycleManager:
 
         self._retiring: List[RetiringCid] = []
 
-    # ---------- Public API ----------
+    def _emit(self, event: Dict[str, Any]) -> None:
+        self.log.log(event)
+        if self.console_callback is not None:
+            try:
+                self.console_callback(event)
+            except Exception:
+                pass
 
     def tick(self, protocol: Any) -> None:
-        """
-        Called periodically by client/server protocol ticker.
-        """
         quic = protocol._quic
         now = time.time()
 
@@ -104,7 +97,6 @@ class CidLifecycleManager:
         if self.policy.cid_policy == "baseline":
             return
 
-        # 1) Detect path changes first
         observed_path_id = self._get_current_path_id(quic)
         observed_path_validated = self._is_current_path_validated(quic)
 
@@ -126,7 +118,6 @@ class CidLifecycleManager:
         if observed_path_id is not None:
             self._current_path_id = observed_path_id
 
-        # 2) Volume-based trigger
         if self.policy.cid_byte_threshold > 0:
             sent_since_allocation = self._bytes_sent_since_allocation(quic)
             if sent_since_allocation >= self.policy.cid_byte_threshold:
@@ -140,7 +131,6 @@ class CidLifecycleManager:
                 )
                 return
 
-        # 3) Time-based trigger
         if now >= self._allocation_deadline:
             self._rotate_now(
                 protocol,
@@ -157,9 +147,6 @@ class CidLifecycleManager:
         path_id: str,
         old_path_id: Optional[str] = None,
     ) -> None:
-        """
-        Path-change trigger. Called when a validated new path is observed.
-        """
         if self.policy.cid_policy != "clm":
             return
 
@@ -173,13 +160,8 @@ class CidLifecycleManager:
         )
 
     def force_rotate(self, protocol: Any, reason: str = "manual") -> None:
-        """
-        Manual rotation for demos / CLI.
-        """
         self._initialize_if_needed(protocol._quic, time.time())
         self._rotate_now(protocol, reason=reason, extra={})
-
-    # ---------- Internal helpers ----------
 
     def _initialize_if_needed(self, quic: Any, now: float) -> None:
         if self._initialized:
@@ -192,7 +174,7 @@ class CidLifecycleManager:
         self._current_cid_hex = self._get_active_cid_hex(quic)
         self._initialized = True
 
-        self.log.log(
+        self._emit(
             {
                 "event": "clm_initialized",
                 "role": self.role,
@@ -217,21 +199,7 @@ class CidLifecycleManager:
         jitter_fraction = max(0.0, self.policy.cid_jitter_fraction)
         delta = self._rng.uniform(-jitter_fraction, jitter_fraction)
         effective_lifetime = self.policy.cid_time_interval_s * (1.0 + delta)
-
-        # never schedule negative / zero lifetime
         effective_lifetime = max(0.001, effective_lifetime)
-
-        self.log.log(
-            {
-                "event": "deadline_scheduled",
-                "role": self.role,
-                "detail": {
-                    "base_interval_s": self.policy.cid_time_interval_s,
-                    "delta": delta,
-                    "effective_lifetime_s": effective_lifetime,
-                },
-            }
-        )
         return now + effective_lifetime
 
     def _rotate_now(self, protocol: Any, reason: str, extra: Dict[str, Any]) -> None:
@@ -242,7 +210,7 @@ class CidLifecycleManager:
             return
 
         if (now - self._last_rotate) < self.policy.min_gap_s:
-            self.log.log(
+            self._emit(
                 {
                     "event": "rotate_skipped",
                     "role": self.role,
@@ -275,7 +243,7 @@ class CidLifecycleManager:
             self._current_path_id = self._get_current_path_id(quic)
             self._current_cid_hex = self._get_active_cid_hex(quic)
 
-            self.log.log(
+            self._emit(
                 {
                     "event": "rotate_ok",
                     "role": self.role,
@@ -291,7 +259,7 @@ class CidLifecycleManager:
                 }
             )
         else:
-            self.log.log(
+            self._emit(
                 {
                     "event": "rotate_failed",
                     "role": self.role,
@@ -312,21 +280,11 @@ class CidLifecycleManager:
         reason: str,
         path_id: Optional[str],
     ) -> tuple[bool, Dict[str, Any]]:
-        """
-        Preferred path:
-          - if grace period > 0 and aioquic internals are present:
-              old = _peer_cid
-              _consume_peer_cid()
-              later call _retire_peer_cid(old)
-          - else:
-              public change_connection_id()
-        """
         detail: Dict[str, Any] = {
             "strategy": None,
             "grace_period_s": self.policy.cid_grace_period_s,
         }
 
-        # Internal deferred retirement path
         if (
             self.policy.cid_grace_period_s > 0
             and hasattr(quic, "_peer_cid")
@@ -379,7 +337,6 @@ class CidLifecycleManager:
                     "note": f"{type(e).__name__}: {e}",
                 }
 
-        # Immediate internal/public path
         if hasattr(quic, "change_connection_id") and callable(getattr(quic, "change_connection_id")):
             try:
                 detail["strategy"] = "public_change_connection_id"
@@ -420,7 +377,7 @@ class CidLifecycleManager:
             except Exception as e:
                 note = f"{type(e).__name__}: {e}"
 
-            self.log.log(
+            self._emit(
                 {
                     "event": "retire_connection_id_emitted" if ok else "retire_connection_id_failed",
                     "role": self.role,
@@ -468,12 +425,10 @@ class CidLifecycleManager:
         return bool(getattr(p, "is_validated", False))
 
     def _get_active_cid_hex(self, quic: Any) -> Optional[str]:
-        # Best current outbound peer CID
         peer_cid = getattr(quic, "_peer_cid", None)
         if peer_cid is not None and hasattr(peer_cid, "cid"):
             return self._safe_hex(peer_cid.cid)
 
-        # Fallback host CID
         host_cid = getattr(quic, "host_cid", None)
         if host_cid is not None:
             return self._safe_hex(host_cid)
